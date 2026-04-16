@@ -12,5 +12,8 @@ openpyxl>=3.1.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 
-# Time-series forecasting (Holt-Winters, STL decomposition)
+# Time-series forecasting (Holt-Winters, VAR, Granger causality)
 statsmodels>=0.14.0
+
+# Market data (DXY, gold spot, WTI) — used by fetch_external_data.py
+yfinance>=0.2.0

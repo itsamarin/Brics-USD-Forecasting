@@ -8,7 +8,9 @@ numpy>=1.24.0
 # Excel file handling
 openpyxl>=3.1.0
 
-# Optional: For advanced visualizations (if extending the project)
-# matplotlib>=3.7.0
-# seaborn>=0.12.0
-# plotly>=5.14.0
+# Visualization (required by generate_prediction_figures.py)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Time-series forecasting (Holt-Winters, STL decomposition)
+statsmodels>=0.14.0

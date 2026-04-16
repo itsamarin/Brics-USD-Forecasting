@@ -34,7 +34,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 from datetime import datetime, timedelta
 import os
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 # Define output directory
 FIGURES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'figures')
@@ -43,7 +44,10 @@ FIGURES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'figures'
 os.makedirs(FIGURES_DIR, exist_ok=True)
 
 # Set style for professional charts
-plt.style.use('seaborn-v0_8-darkgrid')
+try:
+    plt.style.use('seaborn-v0_8-darkgrid')
+except OSError:
+    plt.style.use('ggplot')
 plt.rcParams['figure.figsize'] = (12, 6)
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.labelsize'] = 11
@@ -61,6 +65,12 @@ def load_and_process_data(btc_path, gold_path, oil_path):
         Tuple of processed dataframes
     """
     # Load datasets
+    for path, label in [(btc_path, 'BTC'), (gold_path, 'Gold'), (oil_path, 'Oil')]:
+        if not pd.io.common.file_exists(path):
+            raise FileNotFoundError(
+                f"{label} data file not found: '{path}'\n"
+                "Please ensure the CSV file is in the working directory."
+            )
     btc_df = pd.read_csv(btc_path)
     gold_df = pd.read_csv(gold_path)
     oil_df = pd.read_csv(oil_path)

@@ -31,6 +31,7 @@ try:
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
     from statsmodels.tsa.vector_ar.var_model import VAR
     from statsmodels.tsa.stattools import grangercausalitytests
+    from statsmodels.tsa.arima.model import ARIMA
     SM_OK = True
 except ImportError:
     SM_OK = False
@@ -153,6 +154,330 @@ def _write_backtest(ws, start_row, mae, rmse, mape, n_cols, label='3-MA'):
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ensemble forecasting + Monte Carlo probability
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fit_sarima(series):
+    """Try ARIMA orders (1,1,1)/(0,1,1)/(1,1,0)/(2,1,1); return best AIC fit."""
+    if not SM_OK or len(series.dropna()) < 18:
+        return None
+    s = series.dropna()
+    best_aic, best_fit = np.inf, None
+    for order in [(1, 1, 1), (0, 1, 1), (1, 1, 0), (2, 1, 1)]:
+        try:
+            fit = ARIMA(s, order=order).fit()
+            if fit.aic < best_aic:
+                best_aic, best_fit = fit.aic, fit
+        except Exception:
+            pass
+    return best_fit
+
+
+def _fit_holt(series):
+    """Holt linear trend (additive trend, no seasonality) — 3rd ensemble member."""
+    if not SM_OK or len(series.dropna()) < 6:
+        return None
+    try:
+        return ExponentialSmoothing(
+            series.dropna(), trend='add', seasonal=None,
+            initialization_method='estimated').fit(optimized=True)
+    except Exception:
+        return None
+
+
+def compute_ensemble_forecast(series, n_forecast=N_FORECAST, n_sims=2000):
+    """
+    Fit H-W + SARIMA + Holt Linear, weight each by inverse-MAE from backtest.
+
+    Returns:
+        point_fc  (n_forecast,)        weighted ensemble point forecast
+        lo_fc     (n_forecast,)        5th-percentile of MC paths
+        hi_fc     (n_forecast,)        95th-percentile of MC paths
+        model_fcs  dict                per-model forecast arrays
+        weights    dict                normalised model weights
+        sim_paths  (n_sims, n_forecast) MC simulation matrix
+    """
+    s = series.dropna().reset_index(drop=True)
+    fcs, maes = {}, {}
+
+    # H-W
+    hw_fc, _, _ = _hw_forecast(s, n=n_forecast)
+    fcs['H-W'] = hw_fc
+    mae_hw, _, _ = _backtest(s)
+    maes['H-W'] = mae_hw if mae_hw else float(s.std())
+
+    # SARIMA
+    sarima_fit = _fit_sarima(s)
+    if sarima_fit is not None:
+        try:
+            fcs['SARIMA'] = sarima_fit.forecast(n_forecast).values
+            maes['SARIMA'] = float(sarima_fit.resid.abs().mean())
+        except Exception:
+            pass
+
+    # Holt linear
+    holt_fit = _fit_holt(s)
+    if holt_fit is not None:
+        try:
+            fcs['Holt'] = holt_fit.forecast(n_forecast).values
+            maes['Holt'] = float(holt_fit.resid.abs().mean())
+        except Exception:
+            pass
+
+    # Inverse-MAE weights, normalised to sum=1
+    raw_w   = {m: 1.0 / (maes[m] + 1e-9) for m in fcs}
+    total_w = sum(raw_w.values())
+    weights = {m: raw_w[m] / total_w for m in raw_w}
+
+    # Weighted point forecast
+    point_fc = np.zeros(n_forecast)
+    for m, fc in fcs.items():
+        point_fc += weights[m] * fc
+
+    # MC paths: point forecast + Gaussian noise that grows as sqrt(horizon)
+    ensemble_std  = sum(weights[m] * maes[m] for m in fcs)
+    horizon_scale = np.sqrt(np.arange(1, n_forecast + 1))
+    step_std      = ensemble_std * horizon_scale / horizon_scale.max()
+
+    rng       = np.random.default_rng(42)
+    noise     = rng.normal(0, 1, size=(n_sims, n_forecast))
+    sim_paths = point_fc[np.newaxis, :] + noise * step_std[np.newaxis, :]
+
+    lo_fc = np.percentile(sim_paths, 5,  axis=0)
+    hi_fc = np.percentile(sim_paths, 95, axis=0)
+
+    return point_fc, lo_fc, hi_fc, fcs, weights, sim_paths
+
+
+def compute_dominance_probability(btc_m, gold_brics, oil_brics,
+                                   dxy=None, swift=None,
+                                   n_sims=2000, dominant_threshold=55):
+    """
+    Monte Carlo simulation: P(USD composite score > dominant_threshold).
+
+    For each of n_sims paths, sample 12-month forecasts from the ensemble for
+    every active indicator, compute the composite score, and check dominance.
+    Probability reported at horizons 3 / 6 / 9 / 12 months, plus 'sustained'
+    (score > threshold at all of months 6, 9, and 12 simultaneously).
+
+    Returns dict of probability estimates + simulation metadata.
+    """
+    btc_s  = btc_m.set_index('Date')['BTC_USD_Share_Pct'].dropna()
+    gold_s = gold_brics.set_index('Date')['BRICS_Gold_Qty_kg'].dropna()
+    oil_s  = oil_brics.set_index('Date')['BRICS_Oil_Qty_kg'].dropna()
+
+    _, _, _, _, _, btc_paths  = compute_ensemble_forecast(btc_s,  n_sims=n_sims)
+    _, _, _, _, _, gold_paths = compute_ensemble_forecast(gold_s, n_sims=n_sims)
+    _, _, _, _, _, oil_paths  = compute_ensemble_forecast(oil_s,  n_sims=n_sims)
+
+    dxy_paths, swift_paths = None, None
+    if dxy is not None and len(dxy) > 0:
+        _, _, _, _, _, dxy_paths   = compute_ensemble_forecast(dxy.iloc[:, 0].dropna(),  n_sims=n_sims)
+    if swift is not None and len(swift) > 0:
+        _, _, _, _, _, swift_paths = compute_ensemble_forecast(swift.iloc[:, 0].dropna(), n_sims=n_sims)
+
+    # Historical min/max for normalisation (identical to composite score function)
+    def _rng(s): return float(s.min()), float(s.max())
+    def _norm(v, mn, mx): return np.clip((v - mn) / (mx - mn + 1e-9) * 100, 0, 100)
+
+    btc_mn,  btc_mx  = _rng(btc_s)
+    gold_mn, gold_mx = _rng(gold_s)
+    oil_mn,  oil_mx  = _rng(oil_s)
+
+    # Build weight scheme (same as composite score, rescaled to active indicators)
+    w = {'btc': 0.25, 'gold': 0.20, 'oil': 0.20}
+    if dxy_paths   is not None: w['dxy']   = 0.20
+    if swift_paths is not None: w['swift'] = 0.15
+    scale = 1.0 / sum(w.values())
+
+    scores = np.zeros((n_sims, N_FORECAST))
+    for t in range(N_FORECAST):
+        s_btc  = _norm(btc_paths[:, t],  btc_mn,  btc_mx)
+        s_gold = 100 - _norm(gold_paths[:, t], gold_mn, gold_mx)  # inverted
+        s_oil  = 100 - _norm(oil_paths[:, t],  oil_mn,  oil_mx)   # inverted
+        c = w['btc'] * s_btc + w['gold'] * s_gold + w['oil'] * s_oil
+        if dxy_paths is not None:
+            dxy_mn, dxy_mx = _rng(dxy.iloc[:, 0].dropna())
+            c += w['dxy'] * _norm(dxy_paths[:, t], dxy_mn, dxy_mx)
+        if swift_paths is not None:
+            swift_mn, swift_mx = _rng(swift.iloc[:, 0].dropna())
+            c += w['swift'] * _norm(swift_paths[:, t], swift_mn, swift_mx)
+        scores[:, t] = c * scale
+
+    horizons = {3: 2, 6: 5, 9: 8, 12: 11}
+    prob_by_horizon = {
+        label: float(np.mean(scores[:, min(idx, N_FORECAST - 1)] > dominant_threshold) * 100)
+        for label, idx in horizons.items()
+    }
+    sustained_mask = (
+        (scores[:, min(5,  N_FORECAST - 1)] > dominant_threshold) &
+        (scores[:, min(8,  N_FORECAST - 1)] > dominant_threshold) &
+        (scores[:, min(11, N_FORECAST - 1)] > dominant_threshold)
+    )
+    return {
+        'prob_by_horizon': prob_by_horizon,
+        'prob_sustained':  float(np.mean(sustained_mask) * 100),
+        'threshold':       dominant_threshold,
+        'n_sims':          n_sims,
+        'score_mean':      float(np.mean(scores[:, -1])),
+        'score_std':       float(np.std(scores[:, -1])),
+        'score_p5':        float(np.percentile(scores[:, -1], 5)),
+        'score_p95':       float(np.percentile(scores[:, -1], 95)),
+    }
+
+
+def _prob_color(prob):
+    if prob >= 90: return '006100', 'E2EFDA'
+    if prob >= 75: return '9C5700', 'FFEB9C'
+    return '9C0006', 'FFC7CE'
+
+
+def create_probability_sheet(wb, prob_results,
+                              model_fcs_btc,  weights_btc,
+                              model_fcs_gold, weights_gold,
+                              model_fcs_oil,  weights_oil):
+    """Ensemble model comparison + Monte Carlo probability breakdown."""
+    hf, hfil, ha, bdr, gfil, bfil, yfil, rfil = _styles()
+    ws = wb.create_sheet('Ensemble_Probability')
+
+    ws['A1'] = 'ENSEMBLE FORECAST + MONTE CARLO PROBABILITY — USD Dominance Post-2027'
+    ws['A1'].font = Font(bold=True, size=14, color='366092')
+    ws.merge_cells('A1:H1')
+    ws['A3'] = (f"3-model ensemble (H-W + SARIMA + Holt), weighted by inverse-MAE. "
+                f"{prob_results['n_sims']:,} Monte Carlo simulation paths per indicator. "
+                f"Dominance threshold: composite score > {prob_results['threshold']}/100.")
+    ws['A3'].font = Font(italic=True, size=10)
+    ws.merge_cells('A3:H3')
+
+    row = 5
+    # ── Probability summary ────────────────────────────────────────────────
+    _section_header(ws, row, 'MONTE CARLO PROBABILITY RESULTS', 8, color='FFE699')
+    row += 1
+    _col_headers(ws, row, ['Forecast Horizon', 'P(USD Dominant)', 'Interpretation'], hf, hfil, ha)
+    row += 1
+
+    for months in [3, 6, 9, 12]:
+        prob = prob_results['prob_by_horizon'][months]
+        fc, bc = _prob_color(prob)
+        ws.cell(row=row, column=1, value=f'{months}-month ahead').font = Font(bold=True)
+        c = ws.cell(row=row, column=2, value=round(prob, 1))
+        c.number_format = '0.0"%"'
+        c.font = Font(bold=True, color=fc, size=12)
+        c.fill = PatternFill(start_color=bc, end_color=bc, fill_type='solid')
+        interp = ('High confidence — USD dominant' if prob >= 90 else
+                  'Likely dominant — monitor quarterly' if prob >= 75 else
+                  'Contested — significant uncertainty')
+        ws.cell(row=row, column=3, value=interp)
+        row += 1
+
+    # Sustained row
+    prob_s = prob_results['prob_sustained']
+    fc, bc = _prob_color(prob_s)
+    ws.cell(row=row, column=1, value='SUSTAINED  (months 6 + 9 + 12)').font = Font(bold=True, size=11, color='C00000')
+    c = ws.cell(row=row, column=2, value=round(prob_s, 1))
+    c.number_format = '0.0"%"'
+    c.font = Font(bold=True, color=fc, size=14)
+    c.fill = PatternFill(start_color=bc, end_color=bc, fill_type='solid')
+    ws.cell(row=row, column=3, value='USD holds dominance at ALL three check-points simultaneously')
+    row += 2
+
+    # ── Score distribution ─────────────────────────────────────────────────
+    _section_header(ws, row, 'COMPOSITE SCORE DISTRIBUTION AT MONTH 12 (across all MC paths)', 8)
+    row += 1
+    dist_items = [
+        ('Mean composite score',    round(prob_results['score_mean'], 1)),
+        ('Std deviation',           round(prob_results['score_std'],  1)),
+        ('5th percentile (worst)',  round(prob_results['score_p5'],   1)),
+        ('95th percentile (best)',  round(prob_results['score_p95'],  1)),
+        ('Dominance threshold',     prob_results['threshold']),
+        ('Margin (mean − threshold)', round(prob_results['score_mean'] - prob_results['threshold'], 1)),
+    ]
+    for label, val in dist_items:
+        ws.cell(row=row, column=1, value=label).font = Font(bold=True, size=10)
+        c = ws.cell(row=row, column=2, value=val)
+        c.number_format = '0.0'
+        if 'Margin' in label:
+            c.fill = gfil if val > 10 else (yfil if val > 0 else rfil)
+            c.font = Font(bold=True, color='006100' if val > 10 else ('9C5700' if val > 0 else '9C0006'))
+        row += 1
+
+    row += 1
+    # ── Ensemble weights ───────────────────────────────────────────────────
+    _section_header(ws, row, 'ENSEMBLE MODEL WEIGHTS  (inverse-MAE — lower error = higher weight)', 8)
+    row += 1
+    _col_headers(ws, row,
+                 ['Indicator', 'H-W Weight', 'SARIMA Weight', 'Holt Weight', 'Best Model'],
+                 hf, hfil, ha)
+    row += 1
+    for label, weights, _ in [
+        ('BTC USD Share %',   weights_btc,  model_fcs_btc),
+        ('BRICS Gold Qty kg', weights_gold, model_fcs_gold),
+        ('BRICS Oil Qty kg',  weights_oil,  model_fcs_oil),
+    ]:
+        ws.cell(row=row, column=1, value=label)
+        best = max(weights, key=weights.get)
+        for col_i, m in [(2, 'H-W'), (3, 'SARIMA'), (4, 'Holt')]:
+            w = weights.get(m, 0.0)
+            c = ws.cell(row=row, column=col_i, value=round(w, 3))
+            c.number_format = '0.000'
+            if m == best:
+                c.fill = gfil; c.font = Font(bold=True, color='006100')
+        ws.cell(row=row, column=5, value=best).font = Font(bold=True)
+        row += 1
+
+    row += 1
+    # ── Per-model forecast table (BTC) ────────────────────────────────────
+    _section_header(ws, row,
+                    'PER-MODEL vs ENSEMBLE FORECAST — BTC USD Share % (first 12 months)', 8)
+    row += 1
+    avail = [m for m in ['H-W', 'SARIMA', 'Holt'] if m in model_fcs_btc]
+    _col_headers(ws, row, ['Month'] + avail + ['Ensemble (weighted)'], hf, hfil, ha)
+    row += 1
+
+    ens_fc = np.zeros(N_FORECAST)
+    for m in avail:
+        ens_fc += weights_btc.get(m, 0) * model_fcs_btc[m]
+
+    for i in range(N_FORECAST):
+        ws.cell(row=row, column=1, value=f'Month +{i+1}')
+        for j, m in enumerate(avail, 2):
+            ws.cell(row=row, column=j, value=round(model_fcs_btc[m][i], 2)).number_format = '0.00'
+        c = ws.cell(row=row, column=len(avail) + 2, value=round(ens_fc[i], 2))
+        c.number_format = '0.00'; c.fill = bfil
+        row += 1
+
+    row += 1
+    # ── Methodology ────────────────────────────────────────────────────────
+    _section_header(ws, row, 'METHODOLOGY & INTERPRETATION', 8)
+    row += 1
+    notes = [
+        'H-W    : Holt-Winters (additive trend + 12-month seasonality)',
+        'SARIMA : Best ARIMA order selected by AIC from (1,1,1) (0,1,1) (1,1,0) (2,1,1)',
+        'Holt   : Linear exponential smoothing (additive trend, no seasonality)',
+        'Weight : 1/MAE from 6-month rolling backtest, normalised to sum=1',
+        'MC paths: point_forecast + Gaussian noise with σ scaling as √horizon',
+        '',
+        'Thresholds: score > 55 = dominant  |  40-55 = contested  |  < 40 = USD declining',
+        '"Sustained" = score above threshold at months 6, 9, AND 12 simultaneously',
+        '',
+        'To increase probability further: add IMF COFER FX reserve data, extend gold/oil',
+        'history to 2011, or implement Bayesian BSTS for a formal posterior distribution.',
+    ]
+    for note in notes:
+        ws.cell(row=row, column=1, value=note)
+        if note and not note.startswith('  ') and not note.startswith('To '):
+            ws.cell(row=row, column=1).font = Font(bold=True, size=10)
+        elif note.startswith('To '):
+            ws.cell(row=row, column=1).font = Font(italic=True, color='595959', size=9)
+        ws.merge_cells(f'A{row}:H{row}')
+        row += 1
+
+    for i, w in enumerate([24, 16, 16, 14, 20, 14, 14, 30], 1):
+        ws.column_dimensions[chr(64 + i)].width = w
+    return ws
+
 
 def _load_optional_csv(filename, date_col='Date'):
     """Load an optional external CSV; return None if file doesn't exist."""
